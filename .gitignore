@@ -1,0 +1,30 @@
+# Editor / OS junk
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+venv/
+.venv/
+
+# Local working scratch
+/tmp/
+/scratch/
+
+# Never commit credentials
+oauth_creds.json
+*.token
+.env
+.env.local
+auth.json
