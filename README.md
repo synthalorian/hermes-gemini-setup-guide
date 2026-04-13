@@ -29,6 +29,7 @@ When you finish this guide:
 - A custom `GoogleCodeAssistClient` that handles `thoughtSignature` replay, project discovery, and retry-on-429
 - Aliases: `google-oauth`, `gemini-cli`, `google-gemini-cli` all resolve to the same provider
 - 36+ unit tests mirroring the Qwen provider tests, covering token reads/writes, refresh round-trips, alias resolution, and registry consistency
+- **1 million token context** (1,048,576 tokens) properly configured — hermes knows the full Gemini context window for compression timing and request validation
 - Existing hermes providers (Anthropic, OpenAI, Qwen, Codex, etc.) keep working unchanged
 
 ---
@@ -620,6 +621,112 @@ If memory-tool calling works without a 400, you're done. The thinking-mode repla
 
 ---
 
+## Enabling 1 million token context
+
+Gemini 3 and 2.5 models support up to **1,048,576 tokens** (1M) of context through the Code Assist API. Hermes doesn't get this automatically — you need to tell it. Without explicit configuration, hermes may fall back to a lower detected limit (128K from endpoint probing, or whatever `models.dev` reports) depending on which step in the resolution chain fires first.
+
+### The quick fix
+
+Add `context_length: 1048576` to the `model:` section of `~/.hermes/config.yaml`:
+
+```yaml
+model:
+  default: gemini-3-flash-preview
+  provider: gemini-oauth
+  context_length: 1048576    # <-- THIS LINE
+```
+
+That's it. This is **step 0** in hermes' 10-step context length resolution chain — an explicit config override that takes priority over every other detection method.
+
+### Why this matters
+
+Without the explicit override, hermes resolves context length through a cascade:
+
+1. **Config override** (`model.context_length`) — **wins immediately if set**
+2. Persistent cache (previously discovered via probing)
+3. Active endpoint metadata (`/models` query)
+4. Local server query
+5. Anthropic `/v1/models` API
+6. OpenRouter live API metadata
+7. Nous suffix-match via OpenRouter cache
+8. `models.dev` registry lookup (provider-aware)
+9. Hardcoded defaults (e.g. `"gemini": 1048576`)
+10. Fallback — 128K
+
+The Code Assist endpoint (`cloudcode-pa.googleapis.com`) **does not expose a `/models` endpoint**, so steps 2-3 return nothing. Steps 5-7 don't apply to Gemini OAuth. Step 8 (`models.dev`) *usually* returns the right value — but it depends on `models.dev` being reachable, the model being listed, and the provider mapping being correct. Step 9 has the right hardcoded default (`"gemini": 1048576`), but that's far down the chain and subject to fuzzy matching.
+
+Setting `context_length` in config.yaml **short-circuits all of that** and guarantees hermes knows the full window.
+
+### What 1M context actually enables
+
+With the full 1M window, hermes can:
+
+- **Hold longer conversations** without triggering compression — at the default compression threshold of 50%, hermes won't compress until ~500K tokens of prompt
+- **Ingest entire codebases** in a single session — a large repo's worth of file reads fits comfortably
+- **Preserve more context post-compression** — hermes' compression keeps a "recent tail" of `target_ratio * threshold * context_length`. At 1M, that's `0.20 * 0.50 * 1048576 = ~100K tokens` of recent conversation preserved after compression, vs ~12.8K at 128K context
+- **Multi-turn tool calling** with large tool results — tool outputs from file reads, web fetches, and code execution don't crowd out conversation history as quickly
+
+### Compression tuning for 1M context
+
+Hermes' automatic compression is context-length-aware. With 1M context, the defaults work well:
+
+```yaml
+compression:
+  enabled: true
+  threshold: 0.5       # compress when prompt hits 50% of context (500K tokens)
+  target_ratio: 0.2    # keep 20% of the threshold window as recent tail (~100K)
+  protect_last_n: 20   # always keep the last 20 messages intact
+  summary_model: google/gemini-3-flash-preview   # use the same cheap model to summarize
+```
+
+If you find compression triggering too often (or not often enough), tune `threshold`. A value of `0.7` would let conversations grow to ~700K tokens before compressing.
+
+### The hardcoded fallback
+
+Even without the config override, hermes has a hardcoded default in `agent/model_metadata.py`:
+
+```python
+DEFAULT_CONTEXT_LENGTHS = {
+    # ...
+    "gemini": 1048576,
+    # ...
+}
+```
+
+This catches any model whose name contains `"gemini"` — so `gemini-3-flash-preview`, `gemini-2.5-pro`, etc. all match. But this is step 9 out of 10 in the resolution chain, and fuzzy matching can have edge cases. The explicit config is more reliable and self-documenting.
+
+### Verify it's working
+
+Check what context length hermes is actually using:
+
+```bash
+# In a hermes session, the startup log shows the resolved context length.
+# Look for a line like:
+#   Context length: 1,048,576 tokens
+
+# Or verify programmatically:
+python -c "
+from agent.model_metadata import get_model_context_length
+ctx = get_model_context_length(
+    'gemini-3-flash-preview',
+    config_context_length=1048576,
+    provider='gemini-oauth',
+)
+print(f'Context length: {ctx:,} tokens')
+"
+# Expected: Context length: 1,048,576 tokens
+```
+
+If you see 128,000 instead of 1,048,576, the config override isn't being picked up — double-check that `context_length` is nested under `model:` (not at the top level).
+
+### For claw-code (Rust)
+
+In `claw-code`, Gemini models are **not listed** in the explicit `model_token_limit()` registry, which means they skip context-window validation entirely and let the API handle it natively. No configuration needed — 1M context works out of the box. The difference is architectural: claw-code trusts the API, hermes validates locally.
+
+> For a deeper dive on how context resolution works and edge cases to watch for, see [`docs/context-1m.md`](docs/context-1m.md).
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -631,6 +738,7 @@ If memory-tool calling works without a 400, you're done. The thinking-mode repla
 | `hermes auth add gemini-oauth` fails with `missing ~/.gemini/oauth_creds.json` | Google's `gemini` CLI hasn't been run yet | Run `gemini` once first. |
 | `hermes` keeps using `openai` instead of `gemini-oauth` | `~/.hermes/config.yaml` still points elsewhere | Set `model.provider: gemini-oauth` in config.yaml. |
 | Test `test_auth_gemini_provider.py` fails | Token URL or client_id mismatch | Compare line-by-line against `test_auth_qwen_provider.py` — same shape, just gemini constants. |
+| Context shows 128K instead of 1M | Config override missing or misplaced | Add `context_length: 1048576` under `model:` in `~/.hermes/config.yaml` (not at root level). See [Enabling 1M context](#enabling-1-million-token-context). |
 
 ---
 
@@ -643,7 +751,8 @@ If memory-tool calling works without a 400, you're done. The thinking-mode repla
 ├── docs/
 │   ├── wire-protocol.md               ← Code Assist API request/response shape
 │   ├── thought-signature.md           ← Deep dive on the thinking-mode replay fix
-│   └── pattern-mirror-qwen.md         ← Side-by-side: gemini provider vs qwen provider
+│   ├── pattern-mirror-qwen.md         ← Side-by-side: gemini provider vs qwen provider
+│   └── context-1m.md                  ← Enabling and verifying 1M token context
 ├── examples/
 │   ├── auth_py_diff.py                ← Annotated diff for hermes_cli/auth.py
 │   ├── auth_commands_diff.py          ← Annotated diff for hermes_cli/auth_commands.py
