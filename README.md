@@ -925,6 +925,95 @@ The session pauses for 44 seconds, then resumes automatically. If three retries 
 
 ---
 
+## Multi-tool-call response grouping (the `functionResponse` count mismatch fix)
+
+If the model calls multiple tools in a single turn (e.g., `read_file` + `find_files`), Code Assist requires that **all function responses be grouped into a single `role: user` content block** matching the function call turn. Getting this wrong produces:
+
+```
+400 Bad Request: Please ensure that the number of function response parts is equal
+to the number of function call parts of the function call turn.
+```
+
+### The problem
+
+In OpenAI's format, tool results are sent as separate messages:
+
+```json
+{"role": "assistant", "tool_calls": [
+  {"id": "call_1", "function": {"name": "read_file", ...}},
+  {"id": "call_2", "function": {"name": "find_files", ...}}
+]}
+{"role": "tool", "tool_call_id": "call_1", "content": "..."}
+{"role": "tool", "tool_call_id": "call_2", "content": "..."}
+```
+
+The original hermes translator converted each `tool` message into its own Code Assist content block:
+
+```json
+{"role": "model", "parts": [{"functionCall": {"name": "read_file", ...}}, {"functionCall": {"name": "find_files", ...}}]}
+{"role": "user", "parts": [{"functionResponse": {"name": "read_file", ...}}]}
+{"role": "user", "parts": [{"functionResponse": {"name": "find_files", ...}}]}
+```
+
+Two separate `role: user` blocks, but Code Assist expects one:
+
+```json
+{"role": "model", "parts": [{"functionCall": {"name": "read_file", ...}}, {"functionCall": {"name": "find_files", ...}}]}
+{"role": "user", "parts": [{"functionResponse": {"name": "read_file", ...}}, {"functionResponse": {"name": "find_files", ...}}]}
+```
+
+### The fix
+
+In `agent/google_codeassist_protocol.py`, the `openai_messages_to_codeassist()` function now merges consecutive `tool` messages into a single content block:
+
+```python
+if role == "tool":
+    # ... build the functionResponse part ...
+
+    # Merge with previous content block if it's also a tool-response turn
+    if contents and contents[-1].get("role") == "user" and contents[-1].get("_tool_responses"):
+        contents[-1]["parts"].append(part)
+    else:
+        contents.append({"role": "user", "parts": [part], "_tool_responses": True})
+    continue
+```
+
+The `_tool_responses` flag is an internal marker that gets stripped before serialization:
+
+```python
+# Strip internal _tool_responses markers before serialization
+for block in contents:
+    block.pop("_tool_responses", None)
+```
+
+This works because OpenAI's format guarantees that consecutive `tool` messages all belong to the same preceding `assistant` turn. If a `user` message appears between tool results (shouldn't happen in practice), it breaks the chain and the next tool result starts a new content block — which is correct behavior.
+
+### Why this didn't surface earlier
+
+Single-tool calls work fine — one `functionCall` part, one `functionResponse` part, one content block each. The bug only triggers when the model calls **two or more tools in the same turn**, which happens during parallel tool execution (e.g., reading a file and searching simultaneously). As agent workflows get more complex, multi-tool turns become more common.
+
+### The zero-second retry delay bug (bonus)
+
+This bug was discovered alongside the response grouping issue. When Google returns `"Your quota will reset after 0s."`, the retry delay parser correctly returns `0.0` — but Python treats `0.0` as falsy.
+
+The original code:
+
+```python
+if attempt < max_retries and retry_delay:  # 0.0 is falsy!
+```
+
+This skipped the internal retry entirely, letting the outer retry layer catch the 429 with its own random backoff. The fix:
+
+```python
+if attempt < max_retries and retry_delay is not None:  # 0.0 is a valid delay
+```
+
+Now `"reset after 0s"` means "retry immediately" instead of "skip retry and use random backoff."
+
+> For the full implementation context, see [`docs/multi-tool-fix.md`](docs/multi-tool-fix.md).
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -938,6 +1027,8 @@ The session pauses for 44 seconds, then resumes automatically. If three retries 
 | `hermes` keeps using `openai` instead of `gemini-oauth` | `~/.hermes/config.yaml` still points elsewhere | Set `model.provider: gemini-oauth` in config.yaml. |
 | Test `test_auth_gemini_provider.py` fails | Token URL or client_id mismatch | Compare line-by-line against `test_auth_qwen_provider.py` — same shape, just gemini constants. |
 | Context shows 128K instead of 1M | Config override missing or misplaced | Add `context_length: 1048576` under `model:` in `~/.hermes/config.yaml` (not at root level). See [Enabling 1M context](#enabling-1-million-token-context). |
+| `400: number of function response parts is equal to ... function call parts` | Multi-tool responses not grouped into one content block | Apply the response grouping fix in `google_codeassist_protocol.py`. See [Multi-tool-call response grouping](#multi-tool-call-response-grouping-the-functionresponse-count-mismatch-fix). |
+| 429 retry uses random backoff instead of honoring `"reset after 0s"` | Python truthiness: `0.0` is falsy | Change `if retry_delay:` to `if retry_delay is not None:` in `_post_with_retry`. See [zero-second retry delay bug](#the-zero-second-retry-delay-bug-bonus). |
 
 ---
 
@@ -952,7 +1043,8 @@ The session pauses for 44 seconds, then resumes automatically. If three retries 
 │   ├── thought-signature.md           ← Deep dive on the thinking-mode replay fix
 │   ├── pattern-mirror-qwen.md         ← Side-by-side: gemini provider vs qwen provider
 │   ├── context-1m.md                  ← Enabling and verifying 1M token context
-│   └── rate-limits.md                 ← Handling free-tier 429s with server-guided retry
+│   ├── rate-limits.md                 ← Handling free-tier 429s with server-guided retry
+│   └── multi-tool-fix.md             ← Fixing functionResponse count mismatch + zero-delay bug
 ├── examples/
 │   ├── auth_py_diff.py                ← Annotated diff for hermes_cli/auth.py
 │   ├── auth_commands_diff.py          ← Annotated diff for hermes_cli/auth_commands.py
