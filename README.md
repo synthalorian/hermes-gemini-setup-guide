@@ -26,7 +26,7 @@ When you finish this guide:
 
 - `hermes` runs Gemini 3 (`gemini-3-flash-preview` by default) end-to-end with full tool calling
 - A new `gemini-oauth` provider that reads OAuth tokens from `~/.gemini/oauth_creds.json` (managed by Google's `gemini` CLI — hermes refreshes them in place)
-- A custom `GoogleCodeAssistClient` that handles `thoughtSignature` replay, project discovery, and retry-on-429
+- A custom `GoogleCodeAssistClient` that handles `thoughtSignature` replay, project discovery, and **server-guided retry on 429s** (parses Google's `retryDelay` hints instead of blind backoff)
 - Aliases: `google-oauth`, `gemini-cli`, `google-gemini-cli` all resolve to the same provider
 - 36+ unit tests mirroring the Qwen provider tests, covering token reads/writes, refresh round-trips, alias resolution, and registry consistency
 - **1 million token context** (1,048,576 tokens) properly configured — hermes knows the full Gemini context window for compression timing and request validation
@@ -727,6 +727,204 @@ In `claw-code`, Gemini models are **not listed** in the explicit `model_token_li
 
 ---
 
+## Handling rate limits on the free tier
+
+Google's Code Assist free tier enforces **per-minute quota** — roughly ~5 RPM for Flash models, lower for Pro. When you hit the limit, the API returns a `429` with a response body that tells you exactly how long to wait. The problem: most HTTP clients (and hermes' default OpenAI client) treat 429s as generic failures, either retrying immediately (burning through attempts before the quota resets) or bubbling the error up to the user.
+
+We fixed this by building **server-guided retry** directly into the Code Assist client. Both the hermes (Python) and claw-code (Rust) implementations parse Google's quota-reset hints and sleep for the exact duration before retrying.
+
+### How Google signals rate limits
+
+A 429 response from Code Assist carries the wait time in **two places** (sometimes both, sometimes only one):
+
+**1. `retryDelay` field in the error details array:**
+
+```json
+{
+  "error": {
+    "code": 429,
+    "message": "Quota exceeded for quota metric ...",
+    "details": [
+      {
+        "retryDelay": "44s"
+      }
+    ]
+  }
+}
+```
+
+**2. Natural language in the error message:**
+
+```json
+{
+  "error": {
+    "message": "Your quota will reset after 38s."
+  }
+}
+```
+
+Both implementations parse both forms. The `retryDelay` field is checked first (structured, reliable), with the message regex as a fallback.
+
+### Hermes implementation (Python)
+
+The retry logic lives in `agent/google_codeassist_client.py` in two places — one for non-streaming requests, one for streaming:
+
+**Non-streaming (`_post_with_retry`):**
+
+```python
+def _post_with_retry(self, url, body, timeout, *, max_retries=3):
+    """POST with 429 retry using retryDelay from error response."""
+    client = self._get_http_client()
+    for attempt in range(max_retries + 1):
+        resp = client.post(url, headers=self._headers(), json=body, timeout=timeout)
+        if resp.status_code == 429:
+            retry_delay = self._extract_retry_delay(resp)
+            if attempt < max_retries and retry_delay:
+                logger.info(
+                    "Code Assist 429, retrying in %.1fs (attempt %d/%d)",
+                    retry_delay, attempt + 1, max_retries,
+                )
+                time.sleep(retry_delay)
+                continue
+        if resp.status_code >= 400:
+            raise CodeAssistAPIError(...)
+        return resp
+    raise CodeAssistAPIError("Code Assist API rate limited after max retries", status_code=429)
+```
+
+**The delay parser (`_extract_retry_delay`):**
+
+```python
+@staticmethod
+def _extract_retry_delay(resp):
+    """Extract retry delay from Google error response.
+    
+    Code Assist returns delays in two forms:
+    - retryDelay: "44s" in error details
+    - "Your quota will reset after 38s." in the error message
+    """
+    try:
+        data = resp.json()
+        error = data.get("error", {})
+        # Check details for retryDelay
+        for detail in error.get("details", []):
+            delay_str = detail.get("retryDelay", "")
+            if isinstance(delay_str, str) and delay_str.endswith("s"):
+                return float(delay_str[:-1])
+        # Parse from message: "...reset after 38s."
+        import re
+        msg = error.get("message", "")
+        match = re.search(r"after\s+(\d+)s", msg)
+        if match:
+            return float(match.group(1))
+    except Exception:
+        pass
+    return 12.0  # default for ~5 RPM free tier
+```
+
+**Streaming** follows the same pattern inside `_CodeAssistStreamIterator.__iter__()`. The key difference: streaming responses must call `resp.read()` to consume the body before parsing the error JSON, since the response is in stream mode.
+
+### claw-code implementation (Rust)
+
+The Rust implementation in `google_codeassist.rs` takes the same approach but adds a few extras:
+
+**Constants:**
+
+```rust
+const MAX_RETRIES: u32 = 3;
+const BASE_BACKOFF_MS: u64 = 1500;      // exponential backoff for non-429 errors
+const MAX_RETRY_WAIT_SECS: u64 = 90;    // cap on any single sleep
+```
+
+**Retry loop (`post_with_retry`):**
+
+```rust
+async fn post_with_retry(&self, url: &str, headers: HeaderMap, body: &Value)
+    -> Result<Response, ApiError>
+{
+    for attempt in 0..=MAX_RETRIES {
+        let response = self.http.post(url).headers(headers.clone()).body(body_bytes.clone())
+            .send().await;
+        
+        // Network errors: exponential backoff (1.5s, 3s, 6s)
+        let response = match response {
+            Ok(r) => r,
+            Err(e) => {
+                let wait_ms = BASE_BACKOFF_MS * (1u64 << attempt);
+                tokio::time::sleep(Duration::from_millis(wait_ms)).await;
+                continue;
+            }
+        };
+
+        if response.status().is_success() { return Ok(response); }
+
+        // Non-retryable status: fail immediately
+        if !is_retryable_status(status) || attempt >= MAX_RETRIES {
+            return Err(ApiError::Api { ... });
+        }
+
+        // Server-guided wait (capped at MAX_RETRY_WAIT_SECS)
+        let server_wait = extract_retry_after_seconds(&headers, &body_text)
+            .map(|s| s.min(MAX_RETRY_WAIT_SECS as f64));
+        let wait_secs = server_wait.unwrap_or_else(|| {
+            (BASE_BACKOFF_MS * (1u64 << attempt)) as f64 / 1000.0
+        });
+        tokio::time::sleep(Duration::from_millis((wait_secs * 1000.0) as u64)).await;
+    }
+}
+```
+
+**The delay extractor (`extract_retry_after_seconds`)** checks three sources in priority order:
+
+1. `Retry-After` HTTP header (standard)
+2. `X-RateLimit-Reset-After` / `X-RateLimit-Reset` headers (non-standard but common)
+3. Response body patterns: `"retryDelay": "44s"` and `"reset after 38s"`
+
+It also adds a **+1 second buffer** to the parsed delay to avoid landing right on the quota edge.
+
+**Retryable statuses** cover more than just 429:
+
+```rust
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504)
+}
+```
+
+### Key design decisions
+
+1. **Server-guided, not fixed backoff.** Google tells you exactly when the quota resets. Sleeping for a fixed 30s either wastes time (quota resets in 12s) or retries too early (quota resets in 44s). Parse and honor the server's hint.
+
+2. **Cap the max wait.** The Rust implementation caps at 90 seconds. If Google says "wait 300s", something is wrong — fail fast and let the user know rather than silently blocking for 5 minutes.
+
+3. **Default fallback of 12s.** If the 429 body can't be parsed (malformed JSON, unexpected format), 12 seconds is a reasonable guess for a ~5 RPM quota — it's one tick of the per-minute window.
+
+4. **3 retries max.** Enough to survive a burst of quick requests hitting the quota simultaneously, but not so many that a persistent quota issue keeps the user waiting forever.
+
+5. **Both streaming and non-streaming paths.** In hermes, the streaming iterator has its own retry loop because the `httpx` stream context manager must be re-entered on each attempt. In claw-code, the same `post_with_retry` function handles both paths.
+
+6. **Log the retries.** Both implementations log each retry with the delay and attempt count so you can see what's happening in the session logs.
+
+### What this looks like in practice
+
+When you hit the rate limit during a hermes session, you'll see:
+
+```
+INFO: Code Assist 429, retrying in 44.0s (attempt 1/3)
+```
+
+The session pauses for 44 seconds, then resumes automatically. If three retries all hit 429 (rare — usually the quota resets within one wait), hermes raises a `CodeAssistAPIError` with status 429 and the user sees the error.
+
+### Tips for staying under the free-tier limit
+
+- **Use Flash, not Pro.** Flash has a higher RPM quota on the free tier.
+- **Reduce `max_turns` for automated sessions.** Each turn is at least one API call. Set `agent.max_turns: 30` in config.yaml if you don't need 90.
+- **Batch tool calls.** If your system prompt allows it, encourage the model to call multiple tools in a single turn rather than one at a time.
+- **Watch for retry storms from outer layers.** Hermes' `run_agent` has its own retry logic. If the outer retry fires before the inner Code Assist retry finishes, you get doubled requests. The Code Assist client handles retries internally — outer layers should treat a 429 from `GoogleCodeAssistClient` as terminal (it already retried 3 times).
+
+> For the full implementation details, see [`docs/rate-limits.md`](docs/rate-limits.md).
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause | Fix |
@@ -734,7 +932,8 @@ In `claw-code`, Gemini models are **not listed** in the explicit `model_token_li
 | `400: missing thought_signature` | The cache isn't being populated or replayed | Verify `_SIGNATURE_CACHE` is module-level (in `google_codeassist_protocol.py`), not per-instance. Add `[CA-DEBUG]` prints at cache write/read. |
 | `401 Unauthorized` | Access token expired and refresh failed | Run `gemini` once to re-mint. Check `~/.gemini/oauth_creds.json` has a `refresh_token`. |
 | `403 Permission Denied` on project discovery | Account hasn't been onboarded to Code Assist free tier | Run `gemini` once — Google's CLI also triggers onboarding. Or check `agent/google_codeassist_project.py::onboard_user` is being called. |
-| `429 Quota Exceeded` | Free tier rate limit (~5 RPM for Flash) | The client parses `retryDelay` from the response and sleeps. Check the inner retry actually waits. |
+| `429 Quota Exceeded` | Free tier rate limit (~5 RPM for Flash) | The client parses `retryDelay` from the response and sleeps automatically. If retries still fail, check for retry storms from outer layers. See [Handling rate limits](#handling-rate-limits-on-the-free-tier). |
+| Retry storms (doubled requests on 429) | Outer retry layer fires before inner Code Assist retry completes | The Code Assist client handles retries internally (3 attempts). Outer layers should treat its 429 as terminal. |
 | `hermes auth add gemini-oauth` fails with `missing ~/.gemini/oauth_creds.json` | Google's `gemini` CLI hasn't been run yet | Run `gemini` once first. |
 | `hermes` keeps using `openai` instead of `gemini-oauth` | `~/.hermes/config.yaml` still points elsewhere | Set `model.provider: gemini-oauth` in config.yaml. |
 | Test `test_auth_gemini_provider.py` fails | Token URL or client_id mismatch | Compare line-by-line against `test_auth_qwen_provider.py` — same shape, just gemini constants. |
@@ -752,7 +951,8 @@ In `claw-code`, Gemini models are **not listed** in the explicit `model_token_li
 │   ├── wire-protocol.md               ← Code Assist API request/response shape
 │   ├── thought-signature.md           ← Deep dive on the thinking-mode replay fix
 │   ├── pattern-mirror-qwen.md         ← Side-by-side: gemini provider vs qwen provider
-│   └── context-1m.md                  ← Enabling and verifying 1M token context
+│   ├── context-1m.md                  ← Enabling and verifying 1M token context
+│   └── rate-limits.md                 ← Handling free-tier 429s with server-guided retry
 ├── examples/
 │   ├── auth_py_diff.py                ← Annotated diff for hermes_cli/auth.py
 │   ├── auth_commands_diff.py          ← Annotated diff for hermes_cli/auth_commands.py
