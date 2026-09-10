@@ -1067,7 +1067,7 @@ Now `"reset after 0s"` means "retry immediately" instead of "skip retry and use 
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE).
 
 ---
 
