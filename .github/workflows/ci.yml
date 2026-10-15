@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check JSON/YAML/INI are well-formed
+        run: |
+          pip install --quiet pyyaml
+          python3 - <<'PY'
+          import configparser, json, os, sys
+          import yaml
+          SKIP_DIRS = {".git", "node_modules", "target", "build", "dist", ".dart_tool", "Library", "Temp", "obj", "bin"}
+          JSONC = ("tsconfig", "jsconfig", "devcontainer", ".eslintrc", "settings.json", "extensions.json", "launch.json", "tasks.json")
+          bad = 0
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d != ".vscode"]
+              for f in files:
+                  p = os.path.join(root, f)
+                  low = f.lower()
+                  try:
+                      if low.endswith(".json") and not low.startswith(JSONC):
+                          with open(p, encoding="utf-8-sig") as fh:
+                              json.load(fh)
+                      elif low.endswith((".yml", ".yaml")):
+                          with open(p, encoding="utf-8-sig") as fh:
+                              list(yaml.safe_load_all(fh))
+                      elif low.endswith(".ini"):
+                          with open(p, encoding="utf-8-sig", errors="replace") as fh:
+                              text = fh.read()
+                          cp = configparser.ConfigParser(strict=False, interpolation=None, comment_prefixes=(";", "#"), allow_no_value=True)
+                          cp.optionxform = str
+                          cp.read_string(text if text.lstrip().startswith("[") else "[__root__]\n" + text)
+                  except Exception as e:
+                      bad += 1
+                      print(f"::error file={p}::{type(e).__name__}: {e}".replace("\n", " "))
+          print(f"checked files, {bad} malformed")
+          sys.exit(1 if bad else 0)
+
+          PY
+      - name: Shell script syntax
+        run: |
+          find . -name '*.sh' -not -path './.git/*' -not -path '*/node_modules/*' -print0 | xargs -0 -r -n1 bash -n
+      - name: Check README and LICENSE exist
+        run: |
+          ls README* >/dev/null 2>&1 || { echo "::error::README missing"; exit 1; }
