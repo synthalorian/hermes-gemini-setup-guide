@@ -1,3 +1,5 @@
+![hermes-gemini-setup-guide](.github/preview.png)
+
 # Hermes × Google Gemini (Code Assist) Setup Guide
 
 A step-by-step recipe for adding Google Gemini OAuth support to [`hermes-agent`](https://github.com/nousresearch/hermes-agent) using the same OAuth tokens that Google's official `gemini` CLI mints. Hermes adopts the credentials in place — no parallel token store, no API key required, and you get the **Cloud Code Assist free tier** plus the **`thoughtSignature` replay** fix needed for Gemini 3 thinking-mode multi-turn tool calling.
